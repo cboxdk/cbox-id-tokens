@@ -10,6 +10,7 @@ use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Factory as HttpFactory;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -57,8 +58,50 @@ final class CboxIdTokens
         private readonly HttpFactory $http,
         CacheFactory $cacheFactory,
         ?string $cacheStore = null,
+        bool $allowInsecure = false,
     ) {
+        // SECURITY: a config typo (CBOX_ID_TOKEN_ENDPOINT=http://...)
+        // would otherwise ship the client_secret in the clear over a
+        // single intermediate hop. Reject non-https URLs at boot so
+        // the misconfig is loud and immediate. Empty string is allowed
+        // (some apps don't consume id tokens — the constructor stays
+        // a no-op and any call to fetchToken throws a clear error).
+        if ($tokenEndpoint !== '') {
+            $this->assertSecureScheme($tokenEndpoint, $allowInsecure);
+        }
+
         $this->cache = $cacheFactory->store($cacheStore);
+    }
+
+    private function assertSecureScheme(string $url, bool $allowInsecure): void
+    {
+        $parts = parse_url($url);
+        if ($parts === false || ! isset($parts['scheme'])) {
+            throw new InvalidArgumentException(
+                "tokenEndpoint is not a valid URL: {$url}",
+            );
+        }
+
+        $scheme = strtolower((string) $parts['scheme']);
+        if ($scheme === 'https') {
+            return;
+        }
+
+        // Local-dev escape hatch — http:// is permitted ONLY when the
+        // app explicitly opted in and the host is loopback. Never for
+        // a public host, even with the opt-in, since a typo there is
+        // exactly the leak we're guarding against.
+        $host = strtolower((string) ($parts['host'] ?? ''));
+        $isLoopback = in_array($host, ['localhost', '127.0.0.1', '::1'], true);
+        if ($allowInsecure && $scheme === 'http' && $isLoopback) {
+            return;
+        }
+
+        throw new InvalidArgumentException(
+            "tokenEndpoint must use https:// (got: {$url}). "
+            .'For local dev pass allowInsecure=true with http://localhost — '
+            .'never with a public hostname.',
+        );
     }
 
     public function forAudience(string $audience): TokenRequest
@@ -75,22 +118,31 @@ final class CboxIdTokens
     {
         $cacheKey = $this->cacheKey($audience, $scopes);
 
-        $cached = $this->cache->get($cacheKey);
-        if (is_array($cached)) {
+        $cached = $this->safeCacheGet($cacheKey);
+        if ($cached !== null) {
             $token = ServiceToken::fromArray($cached);
             if (! $token->isExpired()) {
                 return $token;
             }
         }
 
-        $lock = $this->cache->lock($cacheKey.':lock', self::LOCK_TTL_SECONDS);
+        // Cache + lock is the happy path. If cache is unreachable
+        // (Redis blip) we fall through to a direct fetch rather than
+        // failing the outbound call — better to pay an occasional
+        // /oauth/token round-trip per worker than to take a
+        // dependency on cache availability for every outbound call.
+        try {
+            $lock = $this->cache->lock($cacheKey.':lock', self::LOCK_TTL_SECONDS);
+        } catch (Throwable $cacheError) {
+            return $this->fetchFromEndpoint($audience, $scopes);
+        }
 
         try {
             return $lock->block(self::LOCK_BLOCK_SECONDS, function () use ($audience, $scopes, $cacheKey): ServiceToken {
                 // Re-check the cache after acquiring the lock — a
                 // concurrent worker may have populated it while we waited.
-                $cached = $this->cache->get($cacheKey);
-                if (is_array($cached)) {
+                $cached = $this->safeCacheGet($cacheKey);
+                if ($cached !== null) {
                     $token = ServiceToken::fromArray($cached);
                     if (! $token->isExpired()) {
                         return $token;
@@ -105,7 +157,7 @@ final class CboxIdTokens
                 // unambiguous and faster.
                 $secondsUntilExpiry = $token->expiresAt->getTimestamp() - CarbonImmutable::now()->getTimestamp();
                 $ttl = max(1, $secondsUntilExpiry - self::TTL_SAFETY_MARGIN_SECONDS);
-                $this->cache->put($cacheKey, $token->toArray(), $ttl);
+                $this->safeCachePut($cacheKey, $token->toArray(), $ttl);
 
                 return $token;
             });
@@ -120,6 +172,43 @@ final class CboxIdTokens
                 audience: $audience,
                 previous: $e,
             );
+        } catch (TokenFetchException $e) {
+            throw $e;
+        } catch (Throwable $cacheError) {
+            // Lock acquisition succeeded but the inner cache access
+            // (re-check or put) failed — Redis fell over mid-flight.
+            // Bypass the cache and fetch directly so the call still
+            // succeeds. The lock's release happens in lock->block's
+            // own finally.
+            return $this->fetchFromEndpoint($audience, $scopes);
+        }
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function safeCacheGet(string $key): ?array
+    {
+        try {
+            $value = $this->cache->get($key);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_array($value) ? $value : null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $value
+     */
+    private function safeCachePut(string $key, array $value, int $ttl): void
+    {
+        try {
+            $this->cache->put($key, $value, $ttl);
+        } catch (Throwable) {
+            // Cache write failed — log-and-continue is the right call
+            // here. The freshly-fetched token is returned to the
+            // caller; the next outbound call will simply re-fetch.
         }
     }
 
@@ -132,7 +221,13 @@ final class CboxIdTokens
      */
     public function invalidate(string $audience, array $scopes): void
     {
-        $this->cache->forget($this->cacheKey($audience, $scopes));
+        try {
+            $this->cache->forget($this->cacheKey($audience, $scopes));
+        } catch (Throwable) {
+            // Forgetting a non-existent key (Redis down + entry was
+            // never persisted) is a no-op for the caller. The next
+            // fetch goes to /oauth/token regardless.
+        }
     }
 
     /**

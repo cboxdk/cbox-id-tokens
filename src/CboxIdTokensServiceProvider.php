@@ -53,6 +53,7 @@ class CboxIdTokensServiceProvider extends ServiceProvider
                 cacheStore: is_string($config['cache_store'] ?? null) && $config['cache_store'] !== ''
                     ? (string) $config['cache_store']
                     : null,
+                allowInsecure: (bool) ($config['allow_insecure'] ?? false),
             );
         });
     }
