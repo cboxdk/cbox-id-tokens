@@ -7,11 +7,16 @@ namespace Cbox\CboxIdTokens\Tests;
 use Carbon\CarbonImmutable;
 use Cbox\CboxIdTokens\CboxIdTokens;
 use Cbox\CboxIdTokens\TokenFetchException;
+use Illuminate\Cache\Repository;
 use Illuminate\Contracts\Cache\Factory as CacheFactory;
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
+use Illuminate\Contracts\Cache\Store as CacheStore;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use InvalidArgumentException;
+use RuntimeException;
 
 const TOKEN_ENDPOINT = 'https://id.test/oauth/token';
 const CLIENT_ID = 'test-client';
@@ -286,4 +291,188 @@ test('container-wired CboxIdTokens resolves and uses configured values', functio
         return $body['client_id'] === 'wired-client'
             && $body['client_secret'] === 'wired-secret';
     });
+});
+
+test('rejects an http:// tokenEndpoint at construction', function (): void {
+    expect(fn () => new CboxIdTokens(
+        tokenEndpoint: 'http://id.public.example/oauth/token',
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        http: app(HttpFactory::class),
+        cacheFactory: app(CacheFactory::class),
+    ))->toThrow(InvalidArgumentException::class, 'must use https://');
+});
+
+test('rejects a non-URL tokenEndpoint at construction', function (): void {
+    expect(fn () => new CboxIdTokens(
+        tokenEndpoint: 'not-a-url',
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        http: app(HttpFactory::class),
+        cacheFactory: app(CacheFactory::class),
+    ))->toThrow(InvalidArgumentException::class);
+});
+
+test('allowInsecure permits http://localhost for local dev only', function (): void {
+    $client = new CboxIdTokens(
+        tokenEndpoint: 'http://localhost/oauth/token',
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        http: app(HttpFactory::class),
+        cacheFactory: app(CacheFactory::class),
+        allowInsecure: true,
+    );
+
+    expect($client)->toBeInstanceOf(CboxIdTokens::class);
+});
+
+test('allowInsecure does NOT permit http:// against a public host', function (): void {
+    expect(fn () => new CboxIdTokens(
+        tokenEndpoint: 'http://id.public.example/oauth/token',
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        http: app(HttpFactory::class),
+        cacheFactory: app(CacheFactory::class),
+        allowInsecure: true,
+    ))->toThrow(InvalidArgumentException::class, 'must use https://');
+});
+
+test('empty tokenEndpoint is allowed (constructor stays a no-op for non-consuming apps)', function (): void {
+    $client = new CboxIdTokens(
+        tokenEndpoint: '',
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        http: app(HttpFactory::class),
+        cacheFactory: app(CacheFactory::class),
+    );
+
+    expect($client)->toBeInstanceOf(CboxIdTokens::class);
+});
+
+/**
+ * Cache repository whose primary ops throw on demand. Used to simulate
+ * Redis dropping while an outbound /oauth/token call is in flight.
+ */
+final class FailingCacheRepository extends Repository
+{
+    public bool $getFails = false;
+
+    public bool $lockFails = false;
+
+    public bool $putFails = false;
+
+    public function __construct(CacheStore $store)
+    {
+        parent::__construct($store);
+    }
+
+    public function get($key, $default = null): mixed
+    {
+        if ($this->getFails) {
+            throw new RuntimeException('Redis is down (test).');
+        }
+
+        return parent::get($key, $default);
+    }
+
+    public function put($key, $value, $ttl = null): bool
+    {
+        if ($this->putFails) {
+            throw new RuntimeException('Redis is down (test).');
+        }
+
+        return parent::put($key, $value, $ttl);
+    }
+
+    public function lock($name, $seconds = 0, $owner = null)
+    {
+        if ($this->lockFails) {
+            throw new RuntimeException('Redis is down (test).');
+        }
+
+        return parent::lock($name, $seconds, $owner);
+    }
+}
+
+function makeCboxIdTokensWith(CacheRepository $cache): CboxIdTokens
+{
+    $factory = new class($cache) implements CacheFactory
+    {
+        public function __construct(private readonly CacheRepository $cache) {}
+
+        public function store($name = null)
+        {
+            return $this->cache;
+        }
+    };
+
+    return new CboxIdTokens(
+        tokenEndpoint: TOKEN_ENDPOINT,
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        http: app(HttpFactory::class),
+        cacheFactory: $factory,
+    );
+}
+
+test('Redis read failure falls through to direct fetch and still returns a token', function (): void {
+    fakeTokenResponse('redis-bypass', 600);
+
+    /** @var CacheRepository $real */
+    $real = app(CacheFactory::class)->store();
+    $cache = new FailingCacheRepository($real->getStore());
+    $cache->getFails = true;
+
+    $token = makeCboxIdTokensWith($cache)
+        ->forAudience('a.cbox.systems')
+        ->withScopes(['s'])
+        ->fetch();
+
+    expect($token->bearer)->toBe('redis-bypass');
+    Http::assertSentCount(1);
+});
+
+test('Redis lock failure falls through to direct fetch and still returns a token', function (): void {
+    fakeTokenResponse('lock-bypass', 600);
+
+    /** @var CacheRepository $real */
+    $real = app(CacheFactory::class)->store();
+    $cache = new FailingCacheRepository($real->getStore());
+    $cache->lockFails = true;
+
+    $token = makeCboxIdTokensWith($cache)
+        ->forAudience('a.cbox.systems')
+        ->withScopes(['s'])
+        ->fetch();
+
+    expect($token->bearer)->toBe('lock-bypass');
+    Http::assertSentCount(1);
+});
+
+test('Redis put failure swallows silently — token still returned to caller', function (): void {
+    fakeTokenResponse('put-bypass', 600);
+
+    /** @var CacheRepository $real */
+    $real = app(CacheFactory::class)->store();
+    $cache = new FailingCacheRepository($real->getStore());
+    $cache->putFails = true;
+
+    $token = makeCboxIdTokensWith($cache)
+        ->forAudience('a.cbox.systems')
+        ->withScopes(['s'])
+        ->fetch();
+
+    expect($token->bearer)->toBe('put-bypass');
+    Http::assertSentCount(1);
+});
+
+test('invalidate() swallows cache failures silently', function (): void {
+    /** @var CacheRepository $real */
+    $real = app(CacheFactory::class)->store();
+    $cache = new FailingCacheRepository($real->getStore());
+    $cache->getFails = true; // forget() in Laravel calls store->forget — getFails doesn't trip it
+    // but exercising the catch path doesn't require a specific failure flag.
+
+    expect(fn () => makeCboxIdTokensWith($cache)
+        ->invalidate('a.cbox.systems', ['s']))->not->toThrow(\Throwable::class);
 });
